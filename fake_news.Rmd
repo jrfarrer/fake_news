@@ -1,0 +1,1875 @@
+---
+title: "News Accuracy"
+subtitle: 'When the legend becomes fact, print the legend'
+author: "Jordan Farrer"
+date: '2016-12-23'
+output:
+  html_notebook:
+    code_folding: hide
+    css: style.css
+    number_sections: yes
+    theme: flatly
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+# Set options for the rmarkdown file
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = 'center', width = 100)
+```
+
+```{r setup2}
+set.seed(1) # Set the seed for reproducibility
+invisible(Sys.setlocale("LC_ALL", "en_US.UTF-8"))
+options(digits = 4, width = 220) # Prevent printing in scientific notation
+# Create a logger function
+logger <- function(msg, level = "info", file = log_file) {
+    cat(paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S.%OS"), "][", level, "] ", msg, "\n"), file = stdout())
+}
+# Set the project directory
+base_dir <- ''
+data_dir <- paste0(base_dir, "data/")
+code_dir <- paste0(base_dir, "code/")
+viz_dir <- paste0(base_dir, "viz/")
+
+dir.create(data_dir, showWarnings = FALSE)
+dir.create(code_dir, showWarnings = FALSE)
+dir.create(viz_dir, showWarnings = FALSE)
+```
+
+```{r Load Packages}
+pacman::p_load(tidyverse, ggthemes, stringr, glmnet, forcats, randomForest, zipcode,
+              caret, broom, leaps, networkD3, scales, leaflet, rvest, gridExtra, descr,
+              pander, knitr, car, rattle, plotROC, rpart, ROCR, caTools, pROC, highcharter)
+```
+
+```{r Import Fonts}
+# To the font second font, run the following two lines of code and add name of user to vector
+# system(paste0("cp -r ",viz_dir,"fonts/. ~/Library/Fonts/")) # instantaneous
+# font_import() # takes approximately 5-10 min
+users_v <- c("Jordan","rstudio")
+```
+
+```{r Create palette and theme}
+# Create a color palette
+pal538 <- ggthemes_data$fivethirtyeight
+
+# Create a theme to use throughout the analysis
+theme_jrf <- function(base_size = 8, base_family = ifelse(Sys.info()[['user']] %in% users_v, "DecimaMonoPro", "Helvetica")) {
+    theme(
+        plot.background = element_rect(fill = "#F0F0F0", colour = "#606063"), 
+        panel.background = element_rect(fill = "#F0F0F0", colour = NA), 
+        panel.border = element_blank(),
+        panel.grid.major =   element_line(colour = "#D7D7D8"),
+        panel.grid.minor =   element_line(colour = "#D7D7D8", size = 0.25),
+        panel.spacing =       unit(0.25, "lines"),
+        panel.spacing.x =     NULL,
+        panel.spacing.y =     NULL,
+        axis.ticks.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.title = element_text(colour = "#A0A0A3"),
+        axis.text.x = element_text(vjust = 1, colour = '#3C3C3C',
+                                   family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")),
+        axis.text.y = element_text(hjust = 1, colour = '#3C3C3C',
+                                    family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")),
+        legend.background = element_blank(),
+        legend.key = element_blank(), 
+        plot.title = element_text(face = 'bold', colour = '#3C3C3C', hjust = 0),
+        text = element_text(size = 9, family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")),
+        title = element_text(family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"))
+        
+    )
+}
+```
+
+```{r fn_plot_cv_glmnet}
+fn_plot_cv_glmnet <- function(cv_glmnet, main) {
+
+    data <- 
+        tidy(cv_glmnet) %>% as_tibble() %>%
+        mutate(log_lambda = log(lambda)) 
+    
+    data2 <-
+        data %>%
+        filter(row_number() %% 4 == 0)
+    
+    data3 <-
+        data_frame(
+            log_lambda = c(log(cv_glmnet$lambda.min), log(cv_glmnet$lambda.1se))
+            , name = c("Min", "1se")
+        )
+    
+    ggplot() +
+        geom_errorbar(data = data, aes(x = log_lambda, ymin = conf.low, ymax = conf.high), 
+                      colour = pal538['dkgray'][[1]], alpha = 0.6) +
+        geom_point(data = data, aes(x = log_lambda, y = estimate), colour = pal538['red'][[1]]) +
+        geom_vline(xintercept = log(cv_glmnet$lambda.min), colour = pal538['dkgray'][[1]], alpha = 0.6) +
+        geom_vline(xintercept = log(cv_glmnet$lambda.1se), colour = pal538['dkgray'][[1]], alpha = 0.6) + 
+        theme_jrf() +
+        labs(title = main, x = expression(log(lambda)), y = cv_glmnet$name) +
+        geom_text(data = data2, aes(x = log_lambda, y = Inf, label = nzero), vjust = 1, colour = '#3C3C3C',
+                  family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"),
+                  size = 2.25) +
+        geom_label(data = data3, aes(x = log_lambda, y = Inf, label = name), vjust = 5, colour = '#3C3C3C',
+                   family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"))
+}   
+```
+
+```{r}
+fn_regsubsets_plots <- function(fit_obj, elbow = NULL) {
+    regsubsets_summary <- summary(fit_obj)
+    
+    g <- 
+    data_frame(
+          predictors = 1:length(regsubsets_summary$cp)
+        , cp = regsubsets_summary$cp
+        , bic = regsubsets_summary$bic
+        , adjr2 = regsubsets_summary$adjr2
+    ) %>%
+        gather(metric, value, -predictors) %>%
+        mutate(metric = factor(metric, levels = c("cp","bic","adjr2"))) %>%
+        ggplot(aes(x = predictors, y = value, colour = metric)) +
+        facet_grid(metric ~ ., scale = "free_y", switch = "y", 
+                   labeller = ggplot2::labeller(metric = c(cp = "Cp", bic = "BIC", adjr2 = "Adjusted R^2"))) +
+        geom_line() + geom_point() +
+        geom_label(data = data_frame(
+            predictors = c(which.min(regsubsets_summary$cp), which.min(regsubsets_summary$bic),
+                           which.max(regsubsets_summary$adjr2))
+            , metric = factor(c("cp","bic","adjr2"), levels = c("cp","bic","adjr2"))
+            , value = c(min(regsubsets_summary$cp), min(regsubsets_summary$bic), max(regsubsets_summary$adjr2))
+            , label = paste0("Optimal\nd=", c(which.min(regsubsets_summary$cp), which.min(regsubsets_summary$bic),
+                                              which.max(regsubsets_summary$adjr2)))
+            , vjust = c(-.5, -.5, 1.25)
+        ), aes(x = predictors, y = value, label = label, vjust = vjust), family = "DecimaMonoPro") +
+        theme_jrf() + 
+        labs(title = paste0(stringr::str_to_title(regsubsets_summary$obj$method), " Search"), 
+             x = "# of Predictors", y = NULL) +
+        scale_colour_manual(guide = FALSE, values = c(pal538['red'][[1]], pal538['green'][[1]], pal538['blue'][[1]]))
+    
+    if (!is.null(elbow)) {
+        g <- g + geom_vline(xintercept = elbow, alpha = 0.5) + 
+            geom_label(data = data_frame(x = elbow, y = 300, metric = factor(c("cp"), levels = c("cp","bic","adjr2")), 
+                label = "Elbow with\n3 predictors"), aes(x=x,y=y,label=label), colour = "black", hjust = -.1,
+               family = "DecimaMonoPro")
+    }
+    
+    print(g)
+}
+```
+
+
+```{r}
+fn_spline_chart <- function(df, numeric_column, groups, yaxis, title, subtitle) {
+  
+  df2 <- 
+    df %>%
+        mutate_(.dots = setNames(list(paste0("mean(",numeric_column,")")), c("mean"))) %>%
+        group_by_(.dots = lapply(c(groups, "mean"), as.symbol)) %>%
+        summarise_(.dots = setNames(list(paste0("mean(",numeric_column,")")), c("group_mean"))) %>%
+        ungroup() %>%
+        mutate(
+            diff = group_mean - mean
+            , sign = if_else(diff >= 0, 'pos', 'neg')
+            , label = paste0(if_else(sign == "pos", "+", "-"), round(abs(diff), 2))
+        ) %>%
+        rename_(.dots = setNames(groups, "group")) %>%
+        arrange(diff)
+        
+  overall_mean <- round(unique(df2$mean), 2)
+  ymid <-
+    df2 %>%
+      group_by(sign) %>%
+      summarise(ymid = mean(range(diff)))
+
+  ggplot() +
+  geom_bar(data = df2, aes(x = fct_inorder(group), y = diff, fill = sign), stat = 'identity') +
+  coord_flip() +
+  theme_jrf() +
+  guides(fill = FALSE) +
+  geom_hline(data = data_frame(x = 0), mapping = aes(yintercept=x), color = "black", size = 1.5) +
+  scale_fill_manual(values = c('pos' = pal538[['green']], 'neg' = pal538[['red']])) +
+  scale_y_continuous(labels = function(x){return(x + overall_mean)}) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 12)) +
+  labs(x = NULL, y = yaxis, title = title, subtitle = subtitle) +
+  geom_text(data = df2, aes(x = fct_inorder(group), y = diff, label=label, 
+                    hjust = if_else(sign == "pos", if_else(diff < filter(ymid, sign == "pos")$ymid, -0.1, 1.1),
+                                if_else(diff > filter(ymid, sign == "neg")$ymid, 1.1, -0.1))), 
+              colour="black", angle = 0,
+              family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"))
+}
+```
+
+```{r}
+fn_spline_chart_correct <- function(df, groups, yaxis, title, subtitle) {
+  
+  df2 <- 
+    df %>%
+        mutate(rate = sum(correct == "Yes") / n()) %>%
+        group_by_(.dots = lapply(c(groups, "rate"), as.symbol)) %>%
+        summarise_(.dots = setNames(list('sum(correct == "Yes")/n()'), c("group_rate"))) %>%
+        ungroup() %>%
+        mutate(
+            diff = group_rate - rate
+            , sign = if_else(diff >= 0, 'pos', 'neg')
+            , label = paste0(if_else(sign == "pos", "+", "-"), round(abs(diff), 2))
+        ) %>%
+        rename_(.dots = setNames(groups, "group")) %>%
+        arrange(diff)
+        
+  overall_rate <- round(unique(df2$rate), 2)
+  ymid <-
+    df2 %>%
+      group_by(sign) %>%
+      summarise(ymid = mean(range(diff)))
+
+  ggplot() +
+  geom_bar(data = df2, aes(x = fct_inorder(group), y = diff, fill = sign), stat = 'identity') +
+  coord_flip() +
+  theme_jrf() +
+  guides(fill = FALSE) +
+  geom_hline(data = data_frame(x = 0), mapping = aes(yintercept=x), color = "black", size = 1.5) +
+  scale_fill_manual(values = c('pos' = pal538[['green']], 'neg' = pal538[['red']])) +
+  scale_y_continuous(labels = function(x){return(paste0(round(100 * (x + overall_rate), 0), "%"))}) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 12)) +
+  labs(x = NULL, y = yaxis, title = title, subtitle = subtitle) +
+  geom_text(data = df2, aes(x = fct_inorder(group), y = diff, label=label, 
+                    hjust = if_else(sign == "pos", if_else(diff < filter(ymid, sign == "pos")$ymid, -0.1, 1.1),
+                                if_else(diff > filter(ymid, sign == "neg")$ymid, 1.1, -0.1))), 
+              colour="black", angle = 0,
+              family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"))
+}
+```
+
+
+```{r}
+fn_auc_pr <- function(predictions, labels) {
+    pred <- prediction(predictions, labels)
+    perf <- performance(pred, "prec", "rec")
+    f <-
+        data_frame(
+              recall = unlist(perf@x.values) 
+            , precision = unlist(perf@y.values)
+        ) %>%
+        filter(complete.cases(.))
+         
+    auc <- caTools::trapz(f$recall, f$precision)
+    auc
+}
+fn_plot_df <- function(data, data_type, model_list = list()) {
+    if (data_type == "Training") {
+        tmp_df <- 
+        data_frame(
+                `Log. Regression`         = model_list[[1]]$fitted.values 
+                , rpart                   = predict(model_list[[2]], type = "prob")[, 2]  
+                , `Random Forest`         = predict(model_list[[3]], type = "prob")[, 2] 
+                )
+    } else {
+        tmp_df <- 
+        data_frame(
+                `Log. Regression`         = predict(model_list[[1]], data, type = "response")
+                , `rpart`                 = predict(model_list[[2]], data, type = "prob")[, 2]
+                , `Random Forest`         = predict(model_list[[3]], data, type = "prob")[, 2]
+                )
+    }
+    
+    data %>% 
+        select(correct) %>%
+        bind_cols(tmp_df) %>%
+        gather(model, predictions, -correct) %>%
+        mutate(model = factor(model, 
+                              levels = c("Log. Regression","rpart","Random Forest"))) %>%
+        mutate(correct = as.integer(correct) - 1)
+}
+fn_summary <- function(data) {
+    data %>%
+        mutate(
+            fail = ifelse(predictions != correct, 1, 0)
+            , response = ifelse(predictions >= .5, 1, 0)
+            , fp = ifelse(correct == 0 & response == 1, 1, 0)
+            , fn = ifelse(correct == 1 & response == 0, 1, 0)
+        ) %>%
+        group_by(model) %>%
+        summarise(
+               MCE = paste0(round(100 * (sum(fp) + sum(fn)) / n(), 2), "%")
+            , `AUC ROC` = auc(roc(correct, predictions))[1]
+            , `AUC PR` = fn_auc_pr(predictions, correct)
+            ) %>%
+        mutate(
+             `MCE Rank` = dense_rank(`MCE`)
+            , `AUC ROC Rank` = dense_rank(desc(`AUC ROC`))
+            , `AUC PR Rank` = dense_rank(desc(`AUC PR`))
+        ) %>%
+        select(model,MCE,`MCE Rank`,`AUC ROC`,`AUC ROC Rank`,`AUC PR`,`AUC PR Rank`)
+}
+fn_roc_plot <- function(data, data_type) {
+    data %>%
+    ggplot(aes(d = correct, m = predictions, colour = model, linetype = model)) + 
+    geom_roc() + style_roc() + 
+    theme_jrf() +
+    labs(title = paste0("ROC - ",data_type," Data")) +
+    scale_colour_manual("Model", values = c('Log. Regression' = pal538['blue'][[1]], 
+                                            'Random Forest' = pal538['red'][[1]],
+                                            'rpart' = pal538['green'][[1]]
+                                            )) +
+    scale_linetype_manual(values = c(rep("solid", 4), rep("dashed", 1))) +
+    guides(linetype = FALSE)
+}
+fn_pr <- function(x, y, data) {
+    predictions <- data %>% select_(x)
+    labels <- data %>% select_(y)
+    pred <- prediction(predictions, labels)
+    perf <- performance(pred, "prec", "rec")
+    f <-
+        data_frame(
+              recall = unlist(perf@x.values) 
+            , precision = unlist(perf@y.values)
+        ) %>%
+        filter(complete.cases(.))
+    f
+}
+# Create the ROC PR Plot
+fn_pr_plot <- function(data, data_type) {
+    data %>%
+    group_by(model) %>%
+    nest() %>%
+    mutate(pr = purrr::map(data, ~ fn_pr('predictions', 'correct', data = .))) %>%
+    select(model, pr) %>%
+    unnest() %>%
+    ggplot(aes(x = recall, y = precision, colour = model, linetype = model)) + 
+    geom_line() + 
+    theme_jrf() +
+    labs(title = paste0("Precision vs Recall - ",data_type," Data"), x = "Recall", y = "Precision") +
+    scale_colour_manual("Model", values = c('Log. Regression' = pal538['blue'][[1]], 
+                                            'Random Forest' = pal538['red'][[1]],
+                                            'rpart' = pal538['green'][[1]]
+                                            )) +
+    scale_linetype_manual(values = c(rep("solid", 4), rep("dashed", 1))) +
+    guides(linetype = FALSE)
+}
+```
+
+```{r}
+fn_backwards_elimination <- function(lr_model) {
+  
+  df <- Anova(lr_model) %>% tidy()
+  lr_formula1 <- lr_model$formula
+  
+  
+  while (max(df$p.value) > 0.01) {
+    to_remove <- df %>% arrange(desc(p.value)) %>% head(1) %>% select(term) %>% unlist()
+    
+    lr_formula1 <- update(lr_formula1,  as.formula(paste0("~ . -",to_remove)))
+    lr_model <- glm(lr_formula1, data = lr_model$data, family = "binomial")
+
+    df <- Anova(lr_model) %>% tidy()
+     
+  }
+  return(lr_model)
+}
+```
+
+# Executive Summary
+
+During the last US election cycle, there was significant concern about the impact of fake news stories. After the election, [Buzzfeed](www.buzzfeed.com) commissioned [Ipsos Public Affairs](ipsos-na.com) to conduct a large-scale (3,015 respondents) survey to understand how frequently Americans fall victim to fake news stories. In this analysis we use the raw survey data published by Buzzfeed on [GitHub](https://github.com/BuzzFeedNews/2016-12-fake-news-survey) to identify if there are demographic or lifestyle characteristics that correlate with the inability to differentiate inaccurate stories from accurate ones. We find that **age and the candidate that someone voted for in the 2016 presidential election** are best best predictors of whether someone can correctly distinguish between accuracte and inaccurate news headlines.
+
+In the web-app below, the reader seen the headlines used and see how they might have done on such a survey: 
+
+<iframe id = "app_iframe" align = "center" width = "450px", height = "625px"src="https://jordanfarrer.shinyapps.io/fake_news/"></iframe>
+
+# Survey Background
+
+Each respondent was shown 6 of the headlines list in the table below (3 were fake stories and 3 were real stories). All headlines appear on the internet over the past year. 
+
+```{r results = 'asis'}
+articles <- read_delim(paste0(data_dir, "articles.txt"), delim = "|")
+
+articles %>%
+  mutate(Article = paste0("[", article, "](", url, ")")) %>%
+  select(Num = id, Article, Type = type) %>%
+  pander(spit.cell = 65, split.table = Inf, caption = "Actual Headlines shown to Respondents",
+         justify = c("center", "left","center"))
+```
+
+
+For each headline, respondents were asked if they recalled having seen or heard about the headline (possible answers were `yes`, `no`, and `not sure`). When a respondent responded with yes to the recall question, they were asked if they believed the headline to be accurate (possible answers where `very accurate`, `somewhat accurate`, `not very accurate`, and `not at all accurate`).
+
+Prior to questions regarding the headlines, respondents were asked about their political party affiliation and who they voted for during the 2016 presidential election. After responding to questions about the headlines, respondents were asked about the social media website/apps they used and where they consumed news. In addition to their behavioral survey data, for each respondent the survey includes demographic information such as age, race, sex, income, education. Ipsos used this information to determine a representative sample.
+
+All the data used for this analysis is published in [Buzzfeed's GitHub repository](https://github.com/BuzzFeedNews/2016-12-fake-news-survey). Specifically, we used 
+
+1. [Raw Data](https://github.com/BuzzFeedNews/2016-12-fake-news-survey/blob/master/data/raw-data.csv)
+2. [Documenation of Survey Questions](https://github.com/BuzzFeedNews/2016-12-fake-news-survey/blob/master/docs/BF%20News%20Accuracy%20Questionnaire%20Data%20Dictionary.1262016.docx)
+3. [Demographic Distributions](https://github.com/BuzzFeedNews/2016-12-fake-news-survey/blob/master/docs/ipsos-tables.xlsx)
+
+The demographic distributions were used to match the coded data (i.e. `1, 2`) to factor data (i.e. `Male, Female`). This process was quite manual, but the distributions for each demographic characteristic matched the distributions we saw in the raw data so we are confident in our process.
+
+# Data Cleaning 
+
+```{r Download Raw Data from github}
+fn_down_raw_data <- function(df) {
+    download.file(df$url, destfile = paste0(data_dir, df$data, ".", df$file_type), mode="wb", quiet = TRUE)
+    return(df)
+}
+
+data_locations <- 
+    data_frame(
+          data = c("raw_data","survey_questions","demographic_distributions")
+        , file_type = c("csv", "docx","xlsx")
+        , url = c("https://github.com/BuzzFeedNews/2016-12-fake-news-survey/blob/master/data/raw-data.csv?raw=true",
+                  "https://github.com/BuzzFeedNews/2016-12-fake-news-survey/raw/master/docs/BF%20News%20Accuracy%20Questionnaire%20Data%20Dictionary.1262016.docx",
+                  "https://github.com/BuzzFeedNews/2016-12-fake-news-survey/raw/master/docs/ipsos-tables.xlsx")
+    ) %>%
+    do(fn_down_raw_data(.))
+
+raw_data <- read_csv(paste0(data_dir, "raw_data",".","csv"))
+
+articles <- read_delim(paste0(data_dir, "articles.txt"), delim = "|", progress = FALSE)
+```
+
+The raw dataset contains **`r prettyNum(nrow(raw_data), big.mark = ",")`** rows - each representing a survey respondent and **`r prettyNum(ncol(raw_data), big.mark = ",")`** columns - each representing either demographic data, response data, or internal Ipsos coding. Below is a sample:
+
+```{r}
+raw_data %>%
+    head()
+```
+
+We proceed to recode our columns of interest. We find no unexpected missing values. There are missing values in the raw dataset because many of the questions were condition (i.e. if you respond to question 5 that you did not vote you were not asked question 6 regarding who you voted for).
+
+## Demographic
+
+We extract the following cleaned demographic variables:
+
+```{r}
+ipos_labels <- 
+  list(
+      household_income = c('Under $15K','$15K to less than $20K','$20K to less than $25K',
+                           '$25K to less than $30K','$30K to less than $40K','$40K to less than $50K',
+                           '$50K to less than $75K','$75K to less than $100K','$100K to less than $150K',
+                           '$150K or more')                                                              # Tab 151
+    , marital_status   = c("Single","Domestic Partnership","Married","Widowed","Divorced or separated")  # Tab 169
+    , education        = c("Grade School","Some High School","Graduated High School","Some College",
+                           "Associate's degree (AA, AS, etc.)","Bachelor's degree (BA, BS, etc.)",
+                           "Post Graduate Degree")                                                       # Tab 163
+    , employment       = c('Employed - full-time','Employed - part-time','Self-Employed','Retired',
+                           'Student/Pupil','Military','Homemaker','Currently Unemployed','(Dk/Ns)')      # Tab 172
+    , race             = c('White','Black','Asian','Other')                                              # Tab 175
+    , hispanic         = c('Yes','No','(Dk/Ns)')                                                         # Tab 178
+    , gender           = c("Male","Female")                                                              # Tab 154
+    , children         = c('Under 6 only','6-12 Only','13-17 Only','Under 6 and 6-12',
+                           'Under 6 and 13-17','6-12 and 13-17','All 3','None Under 18')                 # Tab 166
+  )
+```
+
+
+```{r results = 'asis'}
+demographics <- 
+  raw_data %>%
+    mutate(
+        household_income = factor(DP_USHHI2_der, labels = ipos_labels[['household_income']])
+      , marital_status = factor(usmar2_der, labels = ipos_labels[['marital_status']])
+      , education = factor(usedu3_der, labels = ipos_labels[['education']])
+      , employment = factor(EMP01_der, labels = ipos_labels[['employment']])
+      , race = factor(USRACE4_der, labels = ipos_labels[['race']])
+      , hispanic = factor(USRETH3_der, labels = ipos_labels[['hispanic']])
+      , gender = factor(resp_gender, labels = ipos_labels[['gender']])
+    ) %>%
+    mutate(
+        id = ID
+      , age = resp_age
+      , market_size = factor(HCAL_STDMKTSIZE_Label_US, levels = c("Non metro", "<1M", "1M-4.9M", "5M+"))
+      , region = as.factor(HCAL_STDREGION_4CODES_Label_US)
+      , state = as.factor(HCAL_REGION1_Label_US)
+      , city = HCAL_Region3_Label_US
+      , zip_code = HADD_ZipCode_US
+    ) %>%
+    mutate(
+      city = stringr::str_to_title(city)
+    ) %>%
+    select(
+        id
+      , gender
+      , age
+      , race
+      , hispanic
+      , marital_status
+      , employment
+      , education
+      , household_income
+      , region
+      , market_size
+      , city
+      , state
+      , zip_code
+    )
+
+fn_summary_table <- function(df) {
+    
+    fn_factor_summary <- function(df, x) {
+        
+        col_vector <- df %>% select_(x) %>% unlist()
+        
+        if(is.factor(col_vector)) {
+            col_levels <- levels(col_vector) %>% head(5)
+            Description <- paste0("*", paste0(col_levels, collapse = "*, *"),"*")
+        }  else {
+            Description <- ""
+        }
+        return(Description)
+    }
+    
+    summary_table <-data_frame(Variable = names(df))
+    
+    summary_table %>%
+        rowwise() %>%
+        mutate(Description = fn_factor_summary(df, Variable))
+}
+
+fn_summary_table(demographics) %>% pander(split.cells = 80, split.table = Inf, justify = c('left', 'left'))
+```
+
+
+## General Responses
+
+We also clean the responses to general political affiliation questions:
+
+```{r results = 'asis'}
+party_responses <-
+  raw_data %>%
+  mutate(
+      party = if_else(DWD1 == 4, 3L, DWD1)
+    , party = factor(party, labels = c("Democrat","Republican","Independent/Other"))
+    , party_strength = factor(coalesce(DWD2, DWD3), labels = c("Strong","Weak"))
+    , sub_party = paste0(if_else(is.na(party_strength), "", paste0(as.character(party_strength), " ")), party)
+    , independent_type = factor(DWD4, labels = c("Democrat","Republican","Neither"))
+    , sub_party = if_else(!is.na(independent_type), paste0(sub_party, ", Lean ", independent_type), sub_party)
+    , sub_party = factor(sub_party, levels = c('Strong Democrat', 'Weak Democrat', 
+                                               'Independent/Other, Lean Democrat',
+                                               'Independent/Other, Lean Neither', 
+                                               'Independent/Other, Lean Republican',
+                                               'Weak Republican', 'Strong Republican'))
+    , voted = factor(if_else(DWD5 != 4, "No", "Yes"), levels = c("No", "Yes"))
+    , candidate = fct_explicit_na(fct_recode(as.factor(DWD6), 
+            "Clinton" = "1", "Trump" = "2", "Johnson" = "3", "Stein" = "4", "Other" = "5"), "Did Not Vote")
+  ) %>%
+  select(id = ID, party, sub_party, voted, candidate)
+
+fn_summary_table(party_responses) %>% pander(split.cells = 80, split.table = Inf, justify = c('center', 'left'))
+```
+
+## Headline Responses
+
+Each time a respondent was shown a question, we have 3 data points:
+
+1. The order they saw this question (1-6)
+2. Whether they recalled the news story
+3. Whether they thought the news story was accurate
+
+Here we identify if the respondent was correct in their selection of accuracy. We define the each response to (3) as correct if respondents said a true story was `Very accurate` or `Somewhat accurate` and a fake story was `Not very accurate` or `Not at all accurate`. We define incorrect as the converse.
+
+```{r}
+headline_order_cols <- c('MRK_ORD_LOOPDWD7_DWD8_A_ORD_LOOPDWD7_DWD8','MRK_ORD_LOOPDWD7_DWD8_B_ORD_LOOPDWD7_DWD8',
+                         'MRK_ORD_LOOPDWD7_DWD8_C_ORD_LOOPDWD7_DWD8','MRK_ORD_LOOPDWD7_DWD8_D_ORD_LOOPDWD7_DWD8',
+                         'MRK_ORD_LOOPDWD7_DWD8_E_ORD_LOOPDWD7_DWD8','MRK_ORD_LOOPDWD7_DWD8_F_ORD_LOOPDWD7_DWD8',
+                         'MRK_ORD_LOOPDWD7_DWD8_G_ORD_LOOPDWD7_DWD8','MRK_ORD_LOOPDWD7_DWD8_H_ORD_LOOPDWD7_DWD8',
+                         'MRK_ORD_LOOPDWD7_DWD8_I_ORD_LOOPDWD7_DWD8','MRK_ORD_LOOPDWD7_DWD8_J_ORD_LOOPDWD7_DWD8',
+                         'MRK_ORD_LOOPDWD7_DWD8_K_ORD_LOOPDWD7_DWD8')
+
+headline_recall_cols <- c('LOOPDWD7_DWD8_A_DWD7','LOOPDWD7_DWD8_B_DWD7','LOOPDWD7_DWD8_C_DWD7','LOOPDWD7_DWD8_D_DWD7',
+                          'LOOPDWD7_DWD8_E_DWD7','LOOPDWD7_DWD8_F_DWD7','LOOPDWD7_DWD8_G_DWD7','LOOPDWD7_DWD8_H_DWD7',
+                          'LOOPDWD7_DWD8_I_DWD7','LOOPDWD7_DWD8_J_DWD7','LOOPDWD7_DWD8_K_DWD7')
+
+headline_accuracy_cols <- c('LOOPDWD7_DWD8_A_DWD8','LOOPDWD7_DWD8_B_DWD8','LOOPDWD7_DWD8_C_DWD8','LOOPDWD7_DWD8_D_DWD8',
+                            'LOOPDWD7_DWD8_E_DWD8','LOOPDWD7_DWD8_F_DWD8','LOOPDWD7_DWD8_G_DWD8','LOOPDWD7_DWD8_H_DWD8',
+                            'LOOPDWD7_DWD8_I_DWD8','LOOPDWD7_DWD8_J_DWD8','LOOPDWD7_DWD8_K_DWD8')
+
+fn_rename_question_cols <- function(x, suffix) {
+  paste0(str_replace_all(str_extract(x, "_[A-Za-z]_"), "_", ""), "_", suffix)
+}
+
+headline_responses <- 
+  raw_data %>%
+    select(one_of(c("ID", headline_order_cols, headline_recall_cols, headline_accuracy_cols))) %>%
+    rename(id = ID) %>%
+    rename_(.dots = setNames(headline_order_cols, fn_rename_question_cols(headline_order_cols, "order"))) %>%
+    rename_(.dots = setNames(headline_recall_cols, fn_rename_question_cols(headline_recall_cols, "recall"))) %>%
+    rename_(.dots = setNames(headline_accuracy_cols, fn_rename_question_cols(headline_accuracy_cols, "accuracy"))) %>%
+    gather(question, response, -id, na.rm = TRUE) %>%
+    separate(col = question, into = c("question","variable"), sep = "_") %>%
+    spread(variable, response) %>%
+    mutate(
+        recall = factor(recall, levels = c(1,2,3), labels = c("Yes","No","Unsure"))
+      , accuracy = factor(accuracy, levels = c(1,2,3, 4), labels = c("Very accurate","Somewhat accurate","Not very accurate","Not at all accurate"))
+      , q_id = match(question, LETTERS)
+      , response = if_else(is.na(accuracy), NA_character_, if_else(accuracy %in% c("Very accurate","Somewhat accurate"), "Real", "Fake"))
+    ) %>%
+    left_join(articles %>% select(-url), by = c("q_id" = "id")) %>%
+    mutate(correct = factor(type == response, labels = c("No" ,"Yes"))) %>%
+    select(id, question, q_id, order, recall, accuracy, article, type, response, correct)
+
+headline_responses %>% head()
+```
+
+## Social Media and News Sources
+
+Respondents were asked how often they used social media sites / apps such as Facebook, Instagram, Pinterest, and Snapchat. They were also given a list of news outlets such as Huffington Post, New York Times, and Buzzfeed and asked whether they used this outlet as a source of news.
+
+```{r}
+fn_news_media <- function(x) {
+  mapping <- c("Multiple times a day","Once a day","A few times a week","Once a week","A few times a month",
+               "Once a month","Less than once a month","I don’t use this social media platform")
+  factor(x, labels = mapping)
+}
+
+fn_share <- function(x) {
+  mapping <- c("Multiple times a day","Once a day","A few times a week","Once a week","A few times a month",
+               "Once a month","Less than once a month","Rarely / never")
+  factor(x, labels = mapping)
+}
+
+
+fn_news_source <- function(x) {
+  mapping <- c("Is a major source of news for me","Is a minor source of news for me",
+               "Is rarely a source of news for me","Is never a source of news for me",
+               "I’m not familiar with this news source")
+  factor(x, labels = mapping)
+}
+
+news_source_responses <- 
+  raw_data %>%
+    rename(
+        Facebook           = GRID_DWD9_1_DWD9
+      , Instagram          = GRID_DWD9_2_DWD9
+      , Pinterest          = GRID_DWD9_3_DWD9
+      , Snapchat           = GRID_DWD9_4_DWD9
+      , Twitter            = GRID_DWD9_5_DWD9
+      , YouTube            = GRID_DWD9_6_DWD9
+      , Share              = DWD10
+      , BuzzFeed           = GRID_DWD11_1_DWD11
+      , Huffington.Post    = GRID_DWD11_2_DWD11
+      , New.York.Times     = GRID_DWD11_3_DWD11
+      , Facebook.News      = GRID_DWD11_4_DWD11
+      , Twitter.News       = GRID_DWD11_5_DWD11
+      , Snapchat.News      = GRID_DWD11_6_DWD11
+      , VICE               = GRID_DWD11_7_DWD11
+      , CNN                = GRID_DWD11_8_DWD11
+      , Vox                = GRID_DWD11_9_DWD11
+      , Business.Insider   = GRID_DWD11_10_DWD11
+      , Washington.Post    = GRID_DWD11_11_DWD11
+      , Google.News        = GRID_DWD11_12_DWD11
+      , Yahoo.News         = GRID_DWD11_13_DWD11
+      , Drudge.Report      = GRID_DWD11_14_DWD11
+      , Fox.News           = GRID_DWD11_15_DWD11
+    ) %>%
+    select(id = ID, Facebook, Instagram, Pinterest, Snapchat, Twitter, YouTube, Share, BuzzFeed, 
+           Huffington.Post, New.York.Times, Facebook.News, Twitter.News, Snapchat.News, VICE, CNN, Vox, 
+           Business.Insider, Washington.Post, Google.News, Yahoo.News, Drudge.Report, Fox.News) %>%
+    mutate_at(.cols = c("Facebook", "Instagram", "Pinterest", "Snapchat", "Twitter", "YouTube"), fn_news_media) %>%
+    mutate_at(.cols = c('Share'), fn_share) %>%
+    mutate_at(.cols = c('BuzzFeed','Huffington.Post','New.York.Times','Facebook.News','Twitter.News',
+                        'Snapchat.News','VICE','CNN','Vox','Business.Insider','Washington.Post',
+                        'Google.News','Yahoo.News','Drudge.Report','Fox.News'), fn_news_source)
+```
+
+## Final Dataset
+
+For a final dataset, we unpivoted the questions so that each record represents a respondent and a headline they were shown. As there are **`r prettyNum(length(unique(raw_data$ID)), big.mark = ',')`** respondents, there are **`r prettyNum(length(unique(raw_data$ID)), big.mark = ',')`** $\times$ 6 = **`r prettyNum(nrow(master_table), big.mark = ',')`** records in our final dataset. Our final dataset includes **`r prettyNum(ncol(master_table), big.mark = ',')`** columns, many engineered (i.e. `correct` as in correct identification of a news story as being accurate/inaccurate) from other variables and number are directly from the original dataset.
+
+```{r}
+master_table <-
+  headline_responses %>%
+  left_join(demographics, by = c("id")) %>%
+  left_join(party_responses, by = c("id")) %>%
+  left_join(news_source_responses, by = c("id"))
+
+master_table %>%
+    head()
+```
+
+# Exploratory Analysis
+
+## Overview
+
+Before we start learning about the survey respondents, let's understand the process they went through in news headline component of the survey. The Sankey diagram below helps chart out this path. The green bar at the left represents the 3,015 respondents. The middle section represents the recall. Each person could recall 0-6 of the headlines. The top bar shows that 1,106 people recalled no headlines and thus were not asked to respond to their accuracy. Any person from a blue boxes in the middle was asked about the accuracy of at least one headline. The boxes at the right indicate how many of the headlines the respondent incorrectly responded to (i.e. `# wrong`). The blue links to the red boxes are the people who answered at least one question incorrectly. Later on in the analysis the people in the blue boxes will be our population of interest in answering the question what factors unlie one's ability to distinguish an accurate news story from an inaccurate one.
+
+```{r}
+sankey_tmp <- 
+  master_table %>%
+    select(id, recall, correct) %>%
+    group_by(id) %>%
+    summarise(
+      num_recall = sum(recall == "Yes", na.rm = TRUE)
+      , num_wrong = sum(correct == "No", na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    group_by(num_recall, num_wrong) %>%
+    count() %>% 
+    ungroup()
+
+sankey_tmp2 <- 
+  union_all(
+    sankey_tmp %>%
+      group_by(num_recall) %>%
+      summarise(n = sum(n)) %>%
+      mutate(
+        SourceName = "All Respondents"
+        , TargetName = paste0("Recalled ", num_recall)
+        , LinkGroup = "Good"
+      ) %>%
+      select(SourceName, TargetName, Value = n, LinkGroup)
+    , 
+    sankey_tmp %>%
+      group_by(num_recall, num_wrong) %>%
+      summarise(n = sum(n)) %>%
+      ungroup() %>%
+      mutate(
+        SourceName = paste0("Recalled ", num_recall)
+        , TargetName = if_else(num_recall == 0 & num_wrong == 0, 'No Response', paste0(as.character(num_wrong), " wrong"))
+        , LinkGroup = if_else(num_wrong > 0, "Bad", "Good")
+      ) %>%
+      select(SourceName, TargetName, Value = n, LinkGroup)
+  )
+
+sankey_nodes <-
+  bind_rows(
+    select(sankey_tmp2, NodeName = SourceName)
+    , select(sankey_tmp2, NodeName = TargetName)
+    ) %>% 
+  distinct() %>%
+  mutate(NodeID = row_number() - 1) %>%
+  select(NodeID, NodeName)
+
+
+sankey_links <-
+  sankey_tmp2 %>%
+  left_join(
+    sankey_nodes, by = c('SourceName' = "NodeName")
+  ) %>% 
+  rename(Source = NodeID) %>%
+  left_join(
+    sankey_nodes, by = c('TargetName' = "NodeName")
+  ) %>% 
+  rename(Target = NodeID) %>%
+  select(Source, Target, Value, LinkGroup)
+  
+  
+sankey_nodes <-
+  sankey_nodes %>%
+  mutate(NodeGroup = 
+           ifelse(NodeName %in% c("Recalled 0", "No Response","0 wrong"), "Other", 
+             ifelse(str_detect(NodeName, "Recall"), "Recall", 
+                  ifelse(str_detect(NodeName, "wrong"), "Wrong", "All"
+                      )))
+  )
+
+
+ColourScale <- 'd3.scale.ordinal()
+            .domain(["Other", "Recall","Wrong","All"])
+           .range(["#D2D2D2", "#008FD5","#FF2700","#77AB43"]);'
+```
+
+```{r}
+sankeyNetwork(Links = sankey_links, Nodes = sankey_nodes, Source = "Source", Target = "Target", Value = "Value", 
+              NodeID = "NodeName", LinkGroup = "LinkGroup", units = "people", NodeGroup = "NodeGroup", colourScale = networkD3::JS(ColourScale), width = 700, height = 450,
+              fontFamily = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"), nodeWidth = 35, fontSize = 12)
+```
+
+
+## Demographics
+
+### Age
+
+The only continous numeric variable in our dataset is age. Below is a histogram:
+
+```{r}
+master_table %>%
+    select(id, age) %>%
+    distinct() %>%
+    ggplot(aes(x = age)) + 
+    geom_histogram(binwidth = 1, fill = pal538[['blue']]) +
+    theme_jrf() +
+    labs(x = "Age", y = "# Respondents", title = "Age")
+    
+```
+
+### Factor Variables
+
+As the majority of the remaining demographic information are factor variables, we will use treemaps to show what percent of the whole 3,015 respondent pool are in each category.
+
+```{r}
+fn_treemap <- function(df, group, title) {
+    
+    df2 <- 
+        df %>%
+        select(one_of(c("id", group))) %>%
+        distinct() %>%
+        group_by_(.dots = lapply(c(group), as.symbol)) %>%
+        count() %>%
+        ungroup() %>%
+        mutate(percent = round(100 * n / sum(n), 2)) %>%
+        rename_(.dots = setNames(group, "group"))
+
+    hchart(df2, "treemap", x = group, y = percent, value = n, color = percent) %>%
+        hc_tooltip(pointFormat = "<b>{point.name}</b>: {point.value}</b> (<b>{point.y}%</b>)<br/>") %>%
+        hc_title(text = title) %>%
+        hc_add_theme(hc_theme_538())
+    
+}
+
+fn_treemap(master_table, "gender", "Gender")
+fn_treemap(master_table, "race", "Race")
+fn_treemap(master_table, "hispanic", "Hispanic")
+fn_treemap(master_table, "education", "Education")
+fn_treemap(master_table, "marital_status", "Marital Status")
+fn_treemap(master_table, "employment", "Employment")
+fn_treemap(master_table, "household_income", "Household Income")
+fn_treemap(master_table, "region", "Region")
+fn_treemap(master_table, "market_size", "Market Size")
+```
+
+## Politics Responses
+
+Similar to demographic information, we will look at the composition of the party affiliation and who respondents voted for as treemaps.
+
+```{r}
+df3 <- 
+    party_responses %>%
+        group_by(party, sub_party) %>%
+        count() %>%
+        ungroup() %>%
+        mutate(y = round(100 * n / sum(n), 2)) %>%
+        mutate(color = ifelse(party == "Democrat", pal538[['blue']], 
+                              ifelse(party == "Republican", pal538[['red']], pal538[['medgray']]))) %>%
+        rename(x = sub_party, value = n)
+
+
+hchart(df3, "treemap", x = x) %>%
+    hc_tooltip(pointFormat = "<b>{point.name}</b>: {point.value}</b> (<b>{point.y}%</b>)<br/>") %>%
+    hc_title(text = "Party Affiliation") %>%
+    hc_add_theme(hc_theme_538())
+```
+
+```{r}
+df4 <- 
+    party_responses %>%
+        group_by(candidate) %>%
+        count() %>%
+        ungroup() %>%
+        mutate(y = round(100 * n / sum(n), 2)) %>%
+        mutate(color = ifelse(candidate == "Trump", pal538[['red']], 
+                              ifelse(candidate == "Clinton", pal538[['blue']], 
+                              ifelse(candidate == "Johnson", pal538[['green']], 
+                              ifelse(candidate == "Stein", "#551A8B",
+                              ifelse(candidate == "Other", pal538[['medgray']],
+                              pal538[['dkgray']])))))
+                                            
+        ) %>%
+        rename(x = candidate, value = n)
+
+
+hchart(df4, "treemap", x = x) %>%
+    hc_tooltip(pointFormat = "<b>{point.name}</b>: {point.value}</b> (<b>{point.y}%</b>)<br/>") %>%
+    hc_title(text = "Candidate") %>%
+    hc_add_theme(hc_theme_538())
+```
+
+## News Sources
+
+Repondents were asked about the different social media services they used and how often. Note how ubiquitous Facebook is - 47% of respondents use it *multiple* times a day! 
+
+```{r Social Media}
+master_table %>%
+  select(id, candidate, Facebook, Instagram, Pinterest, Snapchat, Twitter, YouTube) %>%
+  distinct() %>%
+  gather(social_media_outlet, frequency, -id, -candidate) %>%
+  group_by(social_media_outlet, frequency) %>%
+  count() %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    social_media_outlet = factor(social_media_outlet, 
+                                      levels = c("Facebook", "Instagram", "Pinterest", "Snapchat", "Twitter", "YouTube"))
+    , frequency = factor(frequency, levels = c("Multiple times a day","Once a day","A few times a week","Once a week","A few times a month",
+               "Once a month","Less than once a month","I don’t use this social media platform"))
+  ) %>%  
+  mutate(frequency = fct_recode(frequency, Never = "I don’t use this social media platform")) %>%
+  ggplot(aes(x = frequency, y = fct_rev(social_media_outlet))) +
+  geom_point(aes(size = percent, colour = percent), stat = "identity", position = "identity", shape = 15) +
+  guides(size = FALSE, colour = FALSE) +
+  scale_size_continuous(range = c(6,15)) + 
+  scale_color_gradient(low = pal538[['medgray']], high = pal538[['red']]) +
+  scale_x_discrete(position = "top") +
+  theme(axis.text.x = element_text(angle = 25)) +
+  geom_text(aes(label = percent(percent)), size = 3, family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")) + 
+  theme_jrf() + 
+  labs(x = NULL, y = NULL, title = "How frequently do you visit each of the\nfollowing social media websites / apps?",
+       caption = "3,015 respondents") +
+  theme(title = element_text(size = 10),
+    axis.text = element_text(size = 10), axis.text.x = element_text(hjust = -.05))
+```
+
+## News Sources
+
+Respondents were also asked where they consumed news. The matrix below shows the diversity but also how traditional cable networks still play a big role: 25% of respondents consider Fox News and CNN to be major new sources for them. This is also representative of the age distribution in the sample. Many people say they have never consumed news from Vox, Snapchat, or Twitter - this would not be the case if the population skewed younger.
+
+```{r New Sources, fig.height = 10}
+master_table %>%
+  select(id, candidate, BuzzFeed, 
+           Huffington.Post,New.York.Times, Facebook.News, Twitter.News, Snapchat.News, VICE, CNN, Vox, 
+           Business.Insider, Washington.Post, Google.News, Yahoo.News, Drudge.Report, Fox.News) %>%
+  distinct() %>%
+  gather(news_source, frequency, -id, -candidate) %>%
+  group_by(news_source, frequency) %>%
+  count() %>%
+  mutate(percent = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    news_source = factor(news_source, 
+             levels = c('BuzzFeed','Huffington.Post','New.York.Times','Facebook.News','Twitter.News',
+                        'Snapchat.News','VICE','CNN','Vox','Business.Insider','Washington.Post',
+                        'Google.News','Yahoo.News','Drudge.Report','Fox.News'),
+             labels = c('BuzzFeed','Huffington Post','New York Times','Facebook','Twitter','Snapchat',
+                        'VICE','CNN','Vox','Business Insider','Washington Post','Google News','Yahoo News',
+                        'Drudge Report','Fox News'))
+    , frequency = factor(frequency, levels = c("Is a major source of news for me","Is a minor source of news for me",
+               "Is rarely a source of news for me","Is never a source of news for me",
+               "I’m not familiar with this news source"), 
+               labels = c("Major", "Minor","Rarely","Never","Not Familiar"))
+    
+  ) %>%  
+  #mutate(frequency = fct_recode(frequency, `Rarely / Never` = "I don’t use this social media platform")) %>%
+  ggplot(aes(x = frequency, y = fct_rev(news_source))) +
+  geom_point(aes(size = percent, colour = percent), stat = "identity", position = "identity", shape = 15) +
+  guides(size = FALSE, colour = FALSE) +
+  scale_size_continuous(range = c(6,17)) + 
+  scale_color_gradient(low = pal538[['medgray']], high = pal538[['red']]) +
+  scale_x_discrete(position = "top") +
+  #theme(axis.text.x = element_text(angle = 25)) +
+  geom_text(aes(label = percent(percent)), size = 4, family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")) + 
+  theme_jrf() + 
+  labs(x = NULL, y = NULL, title = "How major or minor of a source it is for you when reading news and current events online?",
+       caption = "3,015 respondents") +
+  theme(title = element_text(size = 10),
+    axis.text = element_text(size = 10))
+```
+
+## Geography
+
+The dataset included zipcode so we were able to map these to show where the 3,015 respondents come from.
+
+```{r}
+data(zipcode)
+
+map_zipcodes <- 
+  master_table %>%
+    select(id, zip_code, age, race, gender) %>%
+    mutate(fill = paste0("Age: ", age, "<br>Race: ", race, "<br>Gender: ", gender)) %>%
+    distinct() %>%
+    left_join(
+          zipcode %>%
+                as_tibble() %>%
+                select(zip, latitude, longitude)
+      , by = c("zip_code" = "zip")
+    ) 
+
+leaflet(data = map_zipcodes, width = 700, height= 450) %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addTiles() %>%
+  addCircleMarkers(~longitude, ~latitude, popup = ~fill, radius = 3, stroke = FALSE, fillOpacity = 0.8, fillColor = pal538[['green']]) %>%
+  setView(lng = -97.11, lat = 37.69, zoom = 3)
+```
+
+Futhermore, we used the new [tilegram program](https://pitchinteractiveinc.github.io/tilegrams/) created by Google to show each US state in proportion to the number of respondents in the survey. As expected, the most populations states (CA, FL, NY, TX) are most represented here. 
+
+```{r}
+state_fips <-
+  read_html("http://www.columbia.edu/~sue/state-fips.html") %>% 
+  html_node("table") %>% 
+  html_table(header = TRUE) %>% 
+  rename(fips = `FIPS Code`, state = `State or District`) %>%
+  mutate(state = if_else(state == "Geogia", "Georgia", state)) %>%
+    inner_join(
+        master_table %>%
+        select(id, state) %>%
+        distinct() %>%
+        group_by(state) %>%
+        count()
+    ) %>%
+    select(fips, n) %>%
+    mutate(fips = str_pad(fips, 2, "left", "0"))
+
+write_csv(state_fips, path = paste0(data_dir,"state_fips.csv"))
+```
+
+```{r}
+knitr::include_graphics(paste0(viz_dir, "tilegram_respondents.png"))
+```
+
+
+# Model Building
+
+Due to how the survey was conducted, if we want to show that there are factors associated with being able to correctly distinguish real and fake news headlines, we need to show that these factors are not the same as those that predict whether one can recall a headline. For example, if being married was associated with recalling headlines and associated with being able to correctly identify real and fake news headlines, we would not be able to say that being married is factor causing proper identification because recall and identification are linked.
+
+What we show in the analysis below is that news sources and social media usage are the determinants underpinning the number of headlines recalled (regardless of real, fake, and all). However, we show that there are a number of other factors associated with proper identification of real and fake headlines, most noteably age and candidate voted for in the 2016 presidential election.
+
+## Recalling Headlines
+
+```{r}
+recall_df <-
+    master_table %>%
+    group_by(id) %>%
+    mutate(
+        num_recall_all = sum(recall == "Yes")
+        , num_recall_true = sum(recall == "Yes" & type == "Real")
+        , num_recall_false = sum(recall == "Yes" & type == "Fake")
+    ) %>%
+    ungroup() %>%
+    select(-question, -q_id, -order, -type, -response, -correct, -article, -recall, -type, -accuracy) %>%
+    distinct() %>%
+    select(-id, -zip_code, -city)
+```
+
+
+We will first attempt to build a model to predict whether or not Americans can recall one of the news headlines. We will split this process into:
+
+1. Identifying any headline
+2. Identifying an inaccurate (false) headline
+3. Identying an accurate (true) headline
+
+
+We will not be using this for prediction, but rather to understand the factors that correlate with someone's ability to recall these particular 11 headlines. For that reason, we are not using training and test datasets here. We will be building three models to see if the factors that influence one's ability to recall a real news headline are the same as the ones that influence the ability to recall a fake news headline. In general, we see that respondents recall **`r round(mean(recall_df$num_recall_all), 2)`** headlines, but are more likely to recall true headlines than fake headlines (thank goodness).
+
+```{r results = 'asis'}
+recall_df %>% 
+  summarise(
+    All = mean(num_recall_all)
+    , Real = mean(num_recall_true)
+    , Fake = mean(num_recall_false)
+  ) %>%
+  gather(Type, `Average Number of Recalls Per Person`) %>%
+  pander()
+```
+
+
+### Recall of Any Headline
+
+We first use a LASSO model for feature selection.
+
+```{r}
+x_matrix_num_recall_all <- model.matrix(num_recall_all ~ . -num_recall_true -num_recall_false, 
+                                        data = recall_df)[, -1]
+y_num_recall_all <- recall_df %>% select(num_recall_all) %>% unlist()
+cv_glmnet_recall_all <- cv.glmnet(x_matrix_num_recall_all, y_num_recall_all, alpha = .99, nfolds = 10)
+fn_plot_cv_glmnet(cv_glmnet_recall_all, "Recall Any LASS")
+```
+
+Then we use the **`r length(unique(beta_lasso_recall_all$var_name))`** variables selected by `lambda.1se` in `regsubsets`.
+
+```{r results = 'hide'}
+beta_lasso_recall_all <- 
+    coef(cv_glmnet_recall_all, s = "lambda.1se") %>% tidy() %>%
+    dplyr::rename(term = row) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(var_name = str_extract(term, paste(names(recall_df), collapse = '|'))) %>%
+    mutate(level = str_replace(term, var_name, ""))
+
+
+regsubsets_fit1 <- regsubsets(as.formula(paste0("num_recall_all ~ ", 
+                                                  paste0(unique(beta_lasso_recall_all$var_name), 
+                                                             collapse = " + "))), data = recall_df,
+                                                              method = "forward", nvmax = 15)
+
+```
+
+```{r}
+fn_regsubsets_plots(regsubsets_fit1)
+```
+
+There looks to be somewhat of an elbow with 10 variables in the Cp and BIC charts so we will use that to create a linear model to predict the number of headlines recalled.
+
+```{r}
+regsubsets_vars_recall_all <- 
+    summary(regsubsets_fit1)$outmat[10, ] %>% 
+        as.data.frame() %>% 
+        tibble::rownames_to_column(var = "term") %>% 
+        filter(`.` == "*") %>%
+        filter(term != "(Intercept)") %>%
+        mutate(var_name = str_extract(term, paste(names(recall_df), collapse = '|'))) %>%
+        mutate(level = str_replace(term, var_name, ""))
+
+fit_recall_all <- lm(as.formula(paste0("num_recall_all ~ ", paste0(unique(regsubsets_vars_recall_all$var_name), 
+                                                             collapse = " + "))), data = recall_df)
+```
+
+Using an Anova table, we see that all of the final predictors are statistically significant in predicting the number of headlines a respondent will recall. 
+
+```{r results = 'asis'}
+Anova(fit_recall_all) %>%
+  tidy() %>%
+  pander(missing = "", caption = "Anova Table: Linear Model Predicting Number of Headlines Recalled")
+```
+
+Finally, we will use a spine chart to show the effect of each of these variables. On average, respondents recall **`r round(mean(recall_df$num_recall_all),2)`** headlines but certain groups of people can identify more or less on average.
+
+```{r fig.height= 12, fig.width=9}
+f1 <- fn_spline_chart(recall_df, numeric_column = "num_recall_all", groups = "sub_party", 
+                yaxis = "Number of Questions Recalled (all)", subtitle = "Number of Headlines Recalled", 
+                title = "Party Affiliation")
+
+f2 <-  fn_spline_chart(recall_df, numeric_column = "num_recall_all", groups = "Share", 
+                yaxis = "Number of Questions Recalled (all)", subtitle = "Number of Headlines Recalled", 
+                title = "Sharing News on Social Media")
+
+f3 <- fn_spline_chart(recall_df, numeric_column = "num_recall_all", groups = "Vox", 
+                yaxis = "Number of Questions Recalled (all)", subtitle = "Number of Headlines Recalled", 
+                title = "Vox")
+
+f4 <- fn_spline_chart(recall_df, numeric_column = "num_recall_all", groups = "Washington.Post", 
+                yaxis = "Number of Questions Recalled (all)", subtitle = "Number of Headlines Recalled", 
+                title = "Washington Post")
+
+f5 <- fn_spline_chart(recall_df, numeric_column = "num_recall_all", groups = "Drudge.Report", 
+                yaxis = "Number of Questions Recalled (all)", subtitle = "Number of Headlines Recalled", 
+                title = "Drudge Report")
+
+f6 <- fn_spline_chart(recall_df, numeric_column = "num_recall_all", groups = "Fox.News", 
+                yaxis = "Number of Questions Recalled (all)", subtitle = "Number of Headlines Recalled", 
+                title = "Fox News")
+
+gridExtra::grid.arrange(f1, f2, f3, f4, f5, f6, ncol=2)
+```
+
+
+### Recall of a Fake Headline
+
+Now we are predicting the number of *fake* headlines identified. Again, we start out with a LASSO model for feature selection.
+
+```{r}
+x_matrix_num_recall_false <- model.matrix(num_recall_false ~ . -num_recall_all -num_recall_true, 
+                                        data = recall_df)[, -1]
+y_num_recall_false <- recall_df %>% select(num_recall_false) %>% unlist()
+cv_glmnet_recall_false <- cv.glmnet(x_matrix_num_recall_false, y_num_recall_false, alpha = .99, nfolds = 10)
+fn_plot_cv_glmnet(cv_glmnet_recall_false, "Recall Fake Stories LASSO")
+```
+
+Then we use the **`r length(unique(beta_lasso_recall_false$var_name))`** variables selected by `lambda.1se` in `regsubsets`.
+
+```{r results = 'hide'}
+beta_lasso_recall_false <- 
+    coef(cv_glmnet_recall_false, s = "lambda.1se") %>% tidy() %>%
+    dplyr::rename(term = row) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(var_name = str_extract(term, paste(names(recall_df), collapse = '|'))) %>%
+    mutate(level = str_replace(term, var_name, ""))
+
+
+regsubsets_fit2 <- regsubsets(as.formula(paste0("num_recall_false ~ ", 
+                                                  paste0(unique(beta_lasso_recall_false$var_name), 
+                                                             collapse = " + "))), data = recall_df,
+                                                              method = "forward", nvmax = 15)
+
+```
+
+Again we use the best 10 variable model.
+
+```{r}
+fn_regsubsets_plots(regsubsets_fit2)
+```
+
+```{r}
+regsubsets_vars_recall_false <- 
+    summary(regsubsets_fit2)$outmat[10, ] %>% 
+        as.data.frame() %>% 
+        tibble::rownames_to_column(var = "term") %>% 
+        filter(`.` == "*") %>%
+        filter(term != "(Intercept)") %>%
+        mutate(var_name = str_extract(term, paste(names(recall_df), collapse = '|'))) %>%
+        mutate(level = str_replace(term, var_name, ""))
+
+fit_recall_false <- lm(as.formula(paste0("num_recall_false ~ ",
+                paste0(unique(regsubsets_vars_recall_false$var_name), collapse = " + "))), data = recall_df)
+```
+
+Using an Anova table, we see that the predictors are similar to those for all headlines. However, there is now Vice News and no longer the New York Times. Education does not appear to be statistically significant at the 0.05 level.
+
+```{r results = 'asis'}
+Anova(fit_recall_false) %>%
+  tidy() %>%
+  pander(missing = "", caption = "Anova Table: Linear Model Predicting Number of Headlines Recalled (Fake Only)")
+```
+
+
+### Recall of a Real Headline
+
+Now we are predicting the number of *real* headlines identified. Again, we start out with a LASSO model for feature selection.
+
+```{r}
+x_matrix_num_recall_true <- model.matrix(num_recall_true ~ . -num_recall_all -num_recall_false, 
+                                        data = recall_df)[, -1]
+y_num_recall_true <- recall_df %>% select(num_recall_true) %>% unlist()
+cv_glmnet_recall_true <- cv.glmnet(x_matrix_num_recall_true, y_num_recall_true, alpha = .99, nfolds = 10)
+fn_plot_cv_glmnet(cv_glmnet_recall_true, "Recall True LASS")
+```
+
+Then we use the **`r length(unique(beta_lasso_recall_true$var_name))`** variables selected by `lambda.1se` in `regsubsets`.
+
+```{r results = 'hide'}
+beta_lasso_recall_true <- 
+    coef(cv_glmnet_recall_true, s = "lambda.1se") %>% tidy() %>%
+    dplyr::rename(term = row) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(var_name = str_extract(term, paste(names(recall_df), collapse = '|'))) %>%
+    mutate(level = str_replace(term, var_name, ""))
+
+
+regsubsets_fit3 <- regsubsets(as.formula(paste0("num_recall_true ~ ", 
+                                                  paste0(unique(beta_lasso_recall_true$var_name), 
+                                                             collapse = " + "))), data = recall_df,
+                                                              method = "forward", nvmax = 15)
+
+```
+
+Again we use the best 10 variable model.
+
+```{r}
+fn_regsubsets_plots(regsubsets_fit3)
+```
+
+```{r}
+regsubsets_vars_recall_true <- 
+    summary(regsubsets_fit3)$outmat[10, ] %>% 
+        as.data.frame() %>% 
+        tibble::rownames_to_column(var = "term") %>% 
+        filter(`.` == "*") %>%
+        filter(term != "(Intercept)") %>%
+        mutate(var_name = str_extract(term, paste(names(recall_df), collapse = '|'))) %>%
+        mutate(level = str_replace(term, var_name, ""))
+
+fit_recall_true <- lm(as.formula(paste0("num_recall_true ~ ", paste0(unique(regsubsets_vars_recall_true$var_name), 
+                                                             collapse = " + "))), data = recall_df)
+```
+
+Using an Anova table, we see that the predictors are nearly the same as the those for all headlines. However, now Twitter has replaced Snapchat, but it is not statistically significant at the 0.01 level anyway.
+
+```{r results = 'asis'}
+Anova(fit_recall_false) %>%
+  tidy() %>%
+  pander(missing = "", caption = "Anova Table: Linear Model Predicting Number of Headlines Recalled (Real Only)")
+```
+
+We have found (unsurprisingly) that whether your can recall a news headline correlates well with news readership. We note that candidate and age have not appear in any of these 3 model building exercises.
+
+## Identifying Accuracy
+
+### Background
+
+Our objective is to create a model to predict whether or not an individual will be able to correctly identify a news headline as accurate or inaccurate (classification). Like the Recall section above, we will break this process into 3 parts
+
+1. Identification of *any* headline
+2. Identification of a *real* headline
+3. Identification of a *fake* headline
+
+We see from the table below that not all of the questions are created equal. Some are more challenging for Americans to classify as accuracy or inaccurate.
+
+```{r results = 'asis'}
+master_table %>% 
+  filter(!is.na(correct)) %>% 
+  group_by(article, q_id, type, correct) %>% 
+  count() %>% 
+  ungroup() %>%
+  spread(correct, n) %>% 
+  mutate(Total = No + Yes) %>% 
+  mutate(
+    No = paste0(round(100 * No/Total, 2), "%")
+    , Yes = paste0(round(100 * Yes/Total, 2), "%")
+  ) %>% 
+  arrange(q_id) %>%
+  select(Num = q_id, Article = article, Type = type, Correct = Yes, Incorrect = No, Total) %>%
+  pander(split.cells = 90, split.table = Inf)
+```
+
+### Identification of Any Headline
+
+#### Feature Selection
+
+To create this prediction model, we will treat each response to the question "Is this headline accuracy?" as an observation. We know this violates the assumption of independence because some of these respondents are the same individual. However, we have reason to believe that because not each question is the same, that the answering of each question can be treated as a separate event.
+
+We create a dataset of **`r prettyNum(ncol(accuracy_df), big.mark = ',')`** columns and **`r prettyNum(ncol(accuracy_df) -1, big.mark = ',')`** predictors of the response `correct`. We then break this dataset into a training (80%) and test (20%) dataset.
+
+```{r}
+accuracy_df <-
+    master_table %>%
+    filter(!is.na(correct)) %>%
+    select(-question, -q_id, -order, -response, -article, -recall, -voted,
+           -type, -accuracy, -id, -zip_code, -city, -state)
+
+
+accuracy_df_train <- sample_frac(accuracy_df, 0.8)
+accuracy_df_test <- dplyr::setdiff(accuracy_df, accuracy_df_train)
+```
+
+We first begin by using `glment` to identify the most important features. 
+
+```{r}
+x_matrix_accuracy_all <- model.matrix(correct ~ ., 
+                                        data = accuracy_df_train)[, -1]
+y_num_accuracy_all <- accuracy_df_train %>% select(correct) %>% unlist()
+cv_glmnet_accuracy_all <- cv.glmnet(x_matrix_accuracy_all, y_num_accuracy_all, 
+                                  family = "binomial", alpha = .99, nfolds = 10)
+fn_plot_cv_glmnet(cv_glmnet_accuracy_all, "Accuracy Any LASSO")
+
+
+beta_lasso_accuracy_all <- 
+    coef(cv_glmnet_accuracy_all, s = "lambda.min") %>% tidy() %>%
+    dplyr::rename(term = row) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(var_name = str_extract(term, paste(names(accuracy_df), collapse = '|'))) %>%
+    mutate(level = str_replace(term, var_name, ""))
+```
+
+#### Logistic Regression
+
+We use the **`r length(unique(beta_lasso_accuracy_all$var_name))`** variables selected by `lambda.min` in the chart above and fit a logistic regression model. We then use Backwards Elimination so that only predictors that are signicant at the 0.01 signifance level are left to create final logistic regression model.
+
+```{r}
+lr_formula <- as.formula(paste0("correct ~ ", paste(unique(beta_lasso_accuracy_all$var_name), collapse = " + ")))
+lr_fit1 <- glm(lr_formula, data = accuracy_df_train, family = "binomial")
+
+lr_fit2 <- fn_backwards_elimination(lr_fit1)
+
+y_actual <- as.numeric(accuracy_df_train$correct == "Yes")
+y_predicted <- ifelse(predict(lr_fit2, accuracy_df_train, type = "response") > .5, 1, 0) 
+mce_lr_fit2 <- mean(y_predicted != y_actual)
+```
+
+We see that this model's misclassification rate (in-sample) is **`r mce_lr_fit2`** which is nearly the same as the trivial model's misclassification rate of **`r mean(rep(1, length(y_predicted)) != y_actual)`**. The trivial model is predicting correct every time, or that no respondent gets it wrong.
+
+#### Classification Tree
+
+We produce a classification tree to see the which variables create the initial splits. Our process is to build a try with `cp = -1` and use the first value of cp that produces a non-root tree to grow a tree.
+
+```{r}
+rpart_fomrula <- as.formula(paste0("correct ~ ", 
+                                    paste(unique(beta_lasso_accuracy_all$var_name), collapse = " + ")))
+
+inf_cp_tree <- rpart(rpart_fomrula, data = accuracy_df_train, 
+                            control = rpart.control(cp = -1), method="class")
+tree_fit <- rpart(rpart_fomrula, data = accuracy_df_train, 
+              control = rpart.control(cp = inf_cp_tree$cptable[2, 1]), method="class")
+fancyRpartPlot(tree_fit, main = "Classification Tree", sub = "")
+```
+
+
+#### Random Forest
+
+We try creating 3 random forest models:
+
+1. Only the variables selected from LASSO
+2. All variables in `accuracy_df_train`
+3. Only `age` and `candidate` - the only significant variables in logistic regression
+
+```{r}
+rf_formula <- rpart_fomrula
+rf_fit_selected_vars <- randomForest(rf_formula, data = accuracy_df_train, ntree = 500)
+rf_fit_all_vars <- randomForest(correct ~ ., data = accuracy_df_train, ntree = 500)
+rf_fit_two_vars <- randomForest(correct ~ age + candidate, data = accuracy_df_train, ntree = 500)
+```
+
+We find that option 3 (only using `age` and `candidate`) produces a model with the best OOB-error rate. Unfortunately, that error rate is still comparable tothe trivial model's error rate.
+
+```{r}
+rf_fit_two_vars$err.rate %>%
+    as_tibble() %>%
+    mutate(id = 1:n()) %>%
+    gather(Error, value, -id) %>%
+    mutate(Error = factor(Error, levels = c("OOB","Yes","No"))) %>%
+    ggplot(aes(x = id, y = value, colour = Error)) +
+    geom_line() +
+    theme_jrf() +
+    labs(title = "Random Forest Error Rate", x = "Trees", y = "Error Rate") +
+    scale_colour_manual(values = c(pal538[4:6] %>% unname()))
+```
+
+#### Model Comparison
+
+##### Training Data
+
+We compare the models we have built by looking at the in-sample misclassification error rate (MSE) and the AUC for the ROC Curve. Unfortunately, none of these models is much better than the trival model (always predict the respondent correctly identified the headline as accurate or inaccurate).
+
+```{r results = 'asis'}
+plot_df_train <- fn_plot_df(accuracy_df_train, "Training", list(lr_fit2, tree_fit, rf_fit_two_vars))
+train_summary <- fn_summary(plot_df_train)
+train_summary %>%
+    pander(caption = "Model Comparison - Training Data")
+```
+
+We explore the ROC curve for the three models.
+
+```{r}
+fn_roc_plot(plot_df_train, "Training")
+```
+
+Below is the Precision-Recall curves for each of the three models.
+
+```{r}
+fn_pr_plot(plot_df_train, "Training")
+```
+
+##### Testing Data
+
+We select the logistic regression model as our final model because of its AUC PR. We imagine that this metric will make the model more robust to new data. We find this to be the case. The logistic regression model has the best MCE and by far the best in AUC PR.
+
+```{r results = 'asis'}
+plot_df_test <- fn_plot_df(accuracy_df_test, "Testing", list(lr_fit2, tree_fit, rf_fit_two_vars))
+test_summary <- fn_summary(plot_df_test)
+test_summary %>%
+    pander(caption = "Model Comparison - Testing Data")
+```
+
+We find that the logistic regression models perform quite well with this dataset.
+
+```{r}
+fn_roc_plot(plot_df_test, "Testing")
+```
+
+
+```{r}
+fn_pr_plot(plot_df_test, "Testing")
+```
+
+#### Summary
+
+```{r}
+lr_fit3 <- glm(correct ~ age + candidate, 
+               data = accuracy_df_train %>% mutate(candidate = fct_relevel(candidate, 'Did Not Vote')), 
+                                                   family = "binomial")
+
+tidy_lr_fit3 <- tidy(lr_fit3)
+
+lr_fit3_summary <-
+  tidy_lr_fit3 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+        odds = exp(estimate)
+      , prob = odds / (1 + odds)
+      , percentage = paste0(round(prob * 100, 2), "%")
+  ) %>%
+  select(-std.error, -statistic)
+
+y_predicted <- ifelse(predict(lr_fit3, accuracy_df_test, type = "response") > .5, 1, 0) 
+y_actual <- as.numeric(accuracy_df_test$correct == "Yes")
+confusion_lr<- table(y_actual, y_predicted)
+```
+
+The final model for all headlines is 
+
+$${Correct} = `r tidy_lr_fit3[1, 2]` + 
+`r tidy_lr_fit3[2, 2]``r tidy_lr_fit3[2, 1]` +
+`r tidy_lr_fit3[3, 2]``r tidy_lr_fit3[3, 1]` +
+`r tidy_lr_fit3[4, 2]``r tidy_lr_fit3[4, 1]` + \\
+`r tidy_lr_fit3[5, 2]``r tidy_lr_fit3[5, 1]` +
+`r tidy_lr_fit3[6, 2]``r tidy_lr_fit3[6, 1]` +
+`r tidy_lr_fit3[7, 2]``r tidy_lr_fit3[7, 1]`$$
+
+
+```{r results = 'asis'}
+pander(descr::CrossTable(y_actual, y_predicted, prop.chisq=FALSE, prop.r = F, prop.c = F, prop.t = TRUE, chisq = TRUE, dnn = c("Correct","Prediction")), split.table = Inf, big.mark = ',')
+```
+
+```{r results = 'asis'}
+lr_fit3_summary %>%
+  select(-percentage) %>%
+  pander()
+```
+
+Holding all other variables constant,
+
++ An increase in **age by one year**, we expect to see about **`r lr_fit3_summary %>% filter(term == "age") %>% select(percentage) %>% unlist()`** *increase* in the probability of correctly predicting the accuracy of a news headline.
++ The difference of voting for **Clinton vs not voting**, we expect to see about **`r lr_fit3_summary %>% filter(term == "candidateClinton") %>% select(percentage) %>% unlist()`** increase in the probability of correctly predicting the accuracy of a news headline.
++ The difference of voting for **Trump vs not voting**, we expect to see about **`r lr_fit3_summary %>% filter(term == "candidateTrump") %>% select(percentage) %>% unlist()`** *decrease* in the probability of correctly predicting the accuracy of a news headline.
++ The difference of voting for **Johnson vs not voting**, we expect to see about **`r lr_fit3_summary %>% filter(term == "candidateJohnson") %>% select(percentage) %>% unlist()`** *increase* in the probability of correctly predicting the accuracy of a news headline.
++ The difference of voting for **Stein vs not voting**, we expect to see about **`r lr_fit3_summary %>% filter(term == "candidateStein") %>% select(percentage) %>% unlist()`** *decrease* in the probability of correctly predicting the accuracy of a news headline.
++ The difference of voting for **another 3rd party candidate vs not voting**, we expect to see about **`r lr_fit3_summary %>% filter(term == "candidateOther") %>% select(percentage) %>% unlist()`** *increase* in the probability of correctly predicting the accuracy of a news headline.
+
+In the plot below, we show the log odds of correctly identifying a news headline as accurate/inaccurate vs Age and by candidate voted for. First, we see that categorically our model predicts that older Americans are better at distinguishing real from fake new stories holding candidate they supported constant. Second, we see that those that voted for Hilary Clinton and Jilly Stein have the highest log odds (and thus probability) of correctly identifying a news headline, while Donald Trump supports have the lowest log odds (and thus probability).
+
+```{r}
+summary_accuracy_all <- glm(correct ~ age + candidate, data = accuracy_df, family = "binomial")
+
+summary_accuracy_all2 <-
+  accuracy_df %>%
+    select(age, candidate, correct) %>%
+    cbind(estimate = predict(summary_accuracy_all, accuracy_df, type = "response")) %>%
+    mutate(
+      odds = exp(estimate)
+      , prob = odds / (1 + odds)
+      , correct = as.numeric(correct == "Yes")
+    )
+
+ggplot(summary_accuracy_all2, aes(x = age, y = estimate, colour = candidate)) +
+  geom_point(position = 'jitter') +
+  stat_smooth(aes(y = correct, colour = candidate), method="glm", method.args = list(family = "binomial"), se=F) +
+  theme_jrf() +
+  labs(x = "Age", y = "Log Odds", title = "Model for Both Real and Fake News Stories", 
+       subtitle = "Log Odds of Correctly Identifying Headline as Accurate/Inaccurate") +
+  scale_colour_discrete(name = "Candidate")
+```
+
+### Identification of a Fake Headline
+
+Now we will limit our model building to only the 5 fake headlines to see if there are a different set of predictors that determine one's ability to determine its accuracy. In other words, we are taking a two-sided problem and making it one-side. Now, we are only looking at the situation where the story is fake and trying to build a model just for these correct and incorrect responses.
+
+```{r}
+accuracy_df_fake <-
+    master_table %>%
+    filter(!is.na(correct)) %>%
+    filter(type == "Fake") %>%
+    select(-question, -q_id, -order, -response, -article, -recall, -voted,
+           -type, -accuracy, -id, -zip_code, -city, -state)
+
+
+accuracy_df_train_fake <- sample_frac(accuracy_df_fake, 0.8)
+accuracy_df_test_fake <- dplyr::setdiff(accuracy_df_fake, accuracy_df_train_fake)
+```
+
+We create a dataset of **`r prettyNum(ncol(accuracy_df), big.mark = ',')`** variables and **`r prettyNum(ncol(accuracy_df) -1, big.mark = ',')`** predictors of the response `correct`. We then break this dataset into a training (80%) and test (20%) dataset as we did before.
+
+```{r}
+x_matrix_accuracy_all_fake <- model.matrix(correct ~ ., 
+                                        data = accuracy_df_train_fake)[, -1]
+y_num_accuracy_all_fake <- accuracy_df_train_fake %>% select(correct) %>% unlist()
+cv_glmnet_accuracy_all_fake <- cv.glmnet(x_matrix_accuracy_all_fake, y_num_accuracy_all_fake, 
+                                  family = "binomial", alpha = .99, nfolds = 10)
+fn_plot_cv_glmnet(cv_glmnet_accuracy_all_fake, "Accuracy - Fake Only - LASSO")
+```
+
+
+```{r}
+beta_lasso_accuracy_all_fake <- 
+    coef(cv_glmnet_accuracy_all_fake, s = "lambda.min") %>% tidy() %>%
+    dplyr::rename(term = row) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(var_name = str_extract(term, paste(names(accuracy_df), collapse = '|'))) %>%
+    mutate(level = str_replace(term, var_name, ""))
+```
+
+#### Logistic Regression
+
+We use the **`r length(unique(beta_lasso_accuracy_all$var_name))`** variables selected by `lambda.min` in the chart above and fit a logistic regression model. We then use Backwards Elimination so that only predictors that are signicant at the 0.01 signifance level are left to create final logistic regression model.
+
+```{r}
+lr_formula_fake <- as.formula(paste0("correct ~ ", paste(unique(beta_lasso_accuracy_all_fake$var_name), collapse = " + ")))
+lr_fit1_fake <- glm(lr_formula_fake, data = accuracy_df_train_fake, family = "binomial")
+
+lr_fit2_fake <- fn_backwards_elimination(lr_fit1_fake)
+
+y_actual_fake <- as.numeric(accuracy_df_train_fake$correct == "Yes")
+y_predicted_fake <- ifelse(predict(lr_fit2_fake, accuracy_df_train_fake, type = "response") > .5, 1, 0) 
+mce_lr_fit2_fake <- mean(y_predicted_fake != y_actual_fake)
+```
+
+We see that this model's misclassification rate (in-sample) is **`r mce_lr_fit2_fake`** which is lower than the trivial model's misclassification rate of **`r mean(rep(0, length(y_predicted_fake)) != y_actual_fake)`**. The trivial model is predicting incorrect every time, or that no respondent gets it right.
+
+#### Classification Tree
+
+We produce a classification tree to see the which variables create the initial splits. Our process is to build a try with `cp = -1` and use the first value of cp that produces a non-root tree to grow a tree.
+
+```{r}
+rpart_fomrula_fake <- as.formula(paste0("correct ~ ", 
+                                    paste(unique(beta_lasso_accuracy_all_fake$var_name), collapse = " + ")))
+
+inf_cp_tree_fake <- rpart(rpart_fomrula_fake, data = accuracy_df_train_fake, 
+                            control = rpart.control(cp = -1), method="class")
+tree_fit_fake <- rpart(rpart_fomrula_fake, data = accuracy_df_train_fake, 
+              control = rpart.control(cp = inf_cp_tree_fake$cptable[2, 1]), method="class")
+fancyRpartPlot(tree_fit_fake, main = "Classification Tree", sub = "")
+```
+
+#### Random Forest
+
+We try creating 3 random forest models:
+
+1. Only the variables selected from LASSO
+2. All variables in `accuracy_df_train_fake`
+3. Only `age` and `candidate` - the only significant variables in logistic regression
+
+```{r}
+rf_formula_fake <- rpart_fomrula_fake
+rf_fit_selected_vars_fake <- randomForest(rf_formula_fake, data = accuracy_df_train_fake, ntree = 500)
+rf_fit_all_vars_fake <- randomForest(correct ~ ., data = accuracy_df_train_fake, ntree = 500)
+rf_fit_two_vars_fake <- randomForest(correct ~ age + candidate, data = accuracy_df_train_fake, ntree = 500)
+```
+
+We find that option 1 (only only the variables selected in LASSO) produces model with the best OOB-error rate. Luckily, that error rate is lower than the trivial model's error rate.
+
+```{r}
+rf_fit_selected_vars_fake$err.rate %>%
+    as_tibble() %>%
+    mutate(id = 1:n()) %>%
+    gather(Error, value, -id) %>%
+    mutate(Error = factor(Error, levels = c("OOB","Yes","No"))) %>%
+    ggplot(aes(x = id, y = value, colour = Error)) +
+    geom_line() +
+    theme_jrf() +
+    labs(title = "Random Forest Error Rate", x = "Trees", y = "Error Rate") +
+    scale_colour_manual(values = c(pal538[4:6] %>% unname()))
+```
+
+
+#### Model Comparison
+
+##### Training Data
+
+In comparing the three models we see that the rpart model likely overfits the data.
+
+```{r results = 'asis'}
+plot_df_train_fake <- fn_plot_df(accuracy_df_train_fake, "Training", list(lr_fit2_fake, tree_fit_fake, rf_fit_selected_vars_fake))
+train_summary_fake <- fn_summary(plot_df_train_fake)
+train_summary_fake %>%
+    pander(caption = "Model Comparison - Training Data")
+```
+
+We explore the ROC curve for the three models.
+
+```{r}
+fn_roc_plot(plot_df_train_fake, "Training")
+```
+
+Below is the Precision-Recall curves for each of the three models.
+
+```{r}
+fn_pr_plot(plot_df_train_fake, "Training")
+```
+
+##### Testing Data
+
+We select the random forest model our final model, but check all three against the testing data. We find that the random forest does ok with respect to MCE, but not AUC.
+ 
+```{r}
+plot_df_test_fake <- fn_plot_df(accuracy_df_test_fake, "Testing", list(lr_fit2_fake, tree_fit_fake, rf_fit_selected_vars_fake))
+test_summary_fake <- fn_summary(plot_df_test_fake)
+test_summary_fake %>%
+    pander(caption = "Model Comparison - Testing Data")
+```
+
+We find that the logistic regression models perform quite well with this dataset.
+
+```{r}
+fn_roc_plot(plot_df_test_fake, "Testing")
+```
+
+
+```{r}
+fn_pr_plot(plot_df_test_fake, "Testing")
+```
+
+#### Summary
+
+```{r}
+y_predicted_fake_test <- ifelse(predict(rf_fit_selected_vars_fake, 
+                                        accuracy_df_test_fake, type = "prob")[, 2] >= .5, 1, 0) 
+y_actual_fake_test <- as.numeric(accuracy_df_test_fake$correct == "Yes")
+confusion_lr_fake_test <- table(y_actual_fake_test, y_predicted_fake_test)
+mce_rf_final <- mean(y_predicted_fake_test != y_actual_fake_test)
+```
+
+Our final model is a random forest model with a testing misclassification rate of **`r mce_rf_final`**, but is worse that the trivial model's misclassification rate of **`r mean(rep(0, length(y_predicted_fake)) != y_actual_fake)`**. Thus, this model would not be useful for prediction. Below is the confusion matrix:
+
+```{r results = 'asis'}
+pander(descr::CrossTable(y_actual_fake_test, y_predicted_fake_test, prop.chisq=FALSE, prop.r = F, prop.c = F, prop.t = TRUE, chisq = TRUE, dnn = c("Correct","Prediction")), split.table = Inf, big.mark = ',')
+```
+
+Below is the feature importance of the variables:
+
+```{r}
+varImp(rf_fit_selected_vars_fake) %>%
+  rownames_to_column("Variable") %>%
+  as_tibble() %>%
+  rename(Importance = Overall) %>%
+  mutate(Importance = Importance / max(Importance)) %>%
+  mutate(Variable = fct_reorder(Variable, Importance)) %>%
+  arrange(desc(Importance)) %>%
+  ggplot() + 
+  geom_segment(aes(x = Variable, xend=Variable, y = Importance, yend=0), color = pal538[['blue']]) +
+  geom_point(aes(x = Variable, y = Importance), color = pal538[['blue']]) +
+  coord_flip() +
+  labs(x = NULL, y = "Relative Importance", title = "Feature Importance in Random Forest",
+       subtitle = "Model for Fake News Stories Only") +
+  theme_jrf()
+```
+
+### Identification of a Real Headline
+
+Now we will limit our model building to only the 6 real headlines to see if there are a different set of predictors that determine one's ability to determine its accuracy.
+
+```{r}
+accuracy_df_real <-
+    master_table %>%
+    filter(!is.na(correct)) %>%
+    filter(type == "Real") %>%
+    select(-question, -q_id, -order, -response, -article, -recall, -voted,
+           -type, -accuracy, -id, -zip_code, -city, -state)
+
+
+accuracy_df_train_real <- sample_frac(accuracy_df_real, 0.8)
+accuracy_df_test_real <- dplyr::setdiff(accuracy_df_real, accuracy_df_train_real)
+```
+
+We create a dataset of **`r prettyNum(ncol(accuracy_df_real), big.mark = ',')`** variables and **`r prettyNum(ncol(accuracy_df_real) -1, big.mark = ',')`** predictors of the response `correct`. We then break this dataset into a training (80%) and test (20%) dataset, as we did in the two previous instances. We use LASSO again for variable selection.
+
+```{r}
+x_matrix_accuracy_all_real <- model.matrix(correct ~ ., 
+                                        data = accuracy_df_train_real)[, -1]
+y_num_accuracy_all_real <- accuracy_df_train_real %>% select(correct) %>% unlist()
+cv_glmnet_accuracy_all_real <- cv.glmnet(x_matrix_accuracy_all_real, y_num_accuracy_all_real, 
+                                  family = "binomial", alpha = .99, nfolds = 10)
+fn_plot_cv_glmnet(cv_glmnet_accuracy_all_real, "Accuracy - Real LASSO")
+
+
+beta_lasso_accuracy_all_real <- 
+    coef(cv_glmnet_accuracy_all_real, s = "lambda.min") %>% tidy() %>%
+    dplyr::rename(term = row) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(var_name = str_extract(term, paste(names(accuracy_df), collapse = '|'))) %>%
+    mutate(level = str_replace(term, var_name, ""))
+```
+
+#### Logistic Regression
+
+We use the **`r length(unique(beta_lasso_accuracy_all_real$var_name))`** variables selected by `lambda.min` in the chart above and fit a logistic regression model. We then use Backwards Elimination so that only predictors that are signicant at the 0.01 signifance level are left to create final logistic regression model. However, there are no variables that significant in predicting whether a respondent with be correct when the headlines are true. So, we will not being using a logistic regression model.
+
+```{r}
+lr_formula_real <- as.formula(paste0("correct ~ ", paste(unique(beta_lasso_accuracy_all_real$var_name), collapse = " + ")))
+lr_fit1_real <- glm(lr_formula_real, data = accuracy_df_train_real, family = "binomial")
+
+lr_fit2_real <- try(fn_backwards_elimination(lr_fit1_real), silent = TRUE)
+```
+
+#### Classification Tree
+
+We produce a classification tree to see the which variables create the initial splits. Our process is to build a try with `cp = -1` and use the first value of cp that produces a non-root tree to grow a tree.
+
+```{r}
+rpart_fomrula_real <- as.formula(paste0("correct ~ ", 
+                                    paste(unique(beta_lasso_accuracy_all_real$var_name), collapse = " + ")))
+
+inf_cp_tree_real <- rpart(rpart_fomrula_real, data = accuracy_df_train_real, 
+                            control = rpart.control(cp = -1), method="class")
+tree_fit_real <- rpart(rpart_fomrula_real, data = accuracy_df_train_real, 
+              control = rpart.control(cp = inf_cp_tree_real$cptable[2, 1]), method="class")
+fancyRpartPlot(tree_fit_real, main = "Classification Tree", sub = "")
+```
+
+#### Random Forest
+
+We try creating 3 random forest models:
+
+1. Only the variables selected from LASSO
+2. All variables in `accuracy_df_train_real`
+3. Only `age` and `candidate` - the only significant variables in logistic regression
+
+```{r}
+rf_formula_real <- rpart_fomrula_real
+rf_fit_selected_vars_real <- randomForest(rf_formula_real, data = accuracy_df_train_real, ntree = 500)
+rf_fit_all_vars_real <- randomForest(correct ~ ., data = accuracy_df_train_real, ntree = 500)
+```
+
+We find that option 3 (only using `age` and `candidate`) produces model with the best OOB-error rate. Unfortunately, that error rate is still higher than the trivial model's error rate.
+
+```{r}
+rf_fit_selected_vars_real$err.rate %>%
+    as_tibble() %>%
+    mutate(id = 1:n()) %>%
+    gather(Error, value, -id) %>%
+    mutate(Error = factor(Error, levels = c("OOB","Yes","No"))) %>%
+    ggplot(aes(x = id, y = value, colour = Error)) +
+    geom_line() +
+    theme_jrf() +
+    labs(title = "Random Forest Error Rate", x = "Trees", y = "Error Rate") +
+    scale_colour_manual(values = c(pal538[4:6] %>% unname()))
+```
+
+#### Feature Importance
+
+As no predictors were significant in the logistic regression model we will not do model selection. Rather, we will show which predictors were important in the random forest model.
+
+```{r}
+varImp(rf_fit_selected_vars_real) %>%
+  rownames_to_column("Variable") %>%
+  as_tibble() %>%
+  rename(Importance = Overall) %>%
+  mutate(Importance = Importance / max(Importance)) %>%
+  mutate(Variable = fct_reorder(Variable, Importance)) %>%
+  arrange(desc(Importance)) %>%
+  ggplot() + 
+  geom_segment(aes(x = Variable, xend=Variable, y = Importance, yend=0), color = pal538[['blue']]) +
+  geom_point(aes(x = Variable, y = Importance), color = pal538[['blue']]) +
+  coord_flip() +
+  labs(x = NULL, y = "Relative Importance", title = "Feature Importance in Random Forest",
+       subtitle = "Model for Real News Stories Only") +
+  theme_jrf()
+```
+
+
+# Conclusion
+
+## Final Results
+
+In this analysis we attempted to build models to predict
+
+1. The number of headlines respondents would recall
+2. Whether or not respondents could distinguish real and fake news
+
+None of our models were better than trivial models on the test datasets. However, we been able to identify from the model-building process some assoications:
+
+1. For correctly distinguishing any type of news we found that the two most important factors were **age** and **candidate voted for in the 2016 presidential election**
+
+```{r}
+accuracy_df_tmp <- 
+    accuracy_df %>%
+        mutate(
+              age_buckets = cut_number(age, 6)
+            , age_buckets = as.character(age_buckets)
+            , age_buckets = gsub("," , " - ", gsub("]", "", gsub("\\(", "", age_buckets)))
+        )
+   
+r1 <- fn_spline_chart_correct(accuracy_df_tmp, group = "age_buckets", yaxis = "% Correct",
+                              title = "Age","% Diff of All News Stories Identified Correctly") 
+
+r2 <- fn_spline_chart_correct(accuracy_df_tmp, group = "candidate", yaxis = "% Correct",
+                              title = "Age","% Diff of All News Stories Identified Correctly") 
+
+gridExtra::grid.arrange(r1, r2, ncol=2)
+```
+
+
+2. For correctly identifying fake news, we identified an number of factors using a random forest model. Below are summaries the 8 most important. In generally, for those that recalled a fake news story, respondents correctly identified it as inaccurate **`r paste0(round(100 * accuracy_df_fake %>% summarise(sum(correct == "Yes") / n()) %>% unlist(), 2),"%")`** of the time. However, certain factors impact this result, as shown below.
+
+```{r fig.height= 14, fig.width=9}
+g1 <- fn_spline_chart_correct(accuracy_df_fake, group = "candidate", yaxis = "% Correct",
+                              title = "Candidate","% Diff of Fake News Stories Identified Correctly")
+g2 <- fn_spline_chart_correct(accuracy_df_fake, group = "Fox.News", yaxis = "% Correct",
+                              title = "Fox News","% Diff of Fake News Stories Identified Correctly")
+g3 <- fn_spline_chart_correct(accuracy_df_fake, group = "sub_party", yaxis = "% Correct",
+                              title = "Party Affiliation","% Diff of Fake News Stories Identified Correctly")
+g4 <- fn_spline_chart_correct(accuracy_df_fake, group = "household_income", yaxis = "% Correct",
+                              title = "Household Income","% Diff of Fake News Stories Identified Correctly")
+g5 <- fn_spline_chart_correct(accuracy_df_fake, group = "Share", yaxis = "% Correct",
+                              title = "Share News","% Diff of Fake News Stories Identified Correctly")
+g6 <- fn_spline_chart_correct(accuracy_df_fake, group = "Pinterest", yaxis = "% Correct",
+                              title = "Pinterest","% Diff of Fake News Stories Identified Correctly")
+g7 <- fn_spline_chart_correct(accuracy_df_fake, group = "YouTube", yaxis = "% Correct",
+                              title = "YouTube","% Diff of Fake News Stories Identified Correctly")
+g8 <- fn_spline_chart_correct(accuracy_df_fake, group = "Snapchat", yaxis = "% Correct",
+                              title = "Snapchat","% Diff of Fake News Stories Identified Correctly")
+
+gridExtra::grid.arrange(g1, g2, g3, g4, g5, g6, g7, g8, ncol=2)
+```
+
+## Limitations & Next Steps
+
+1. It is unclear whether this is truly a representative sample. Ipsos used weighting for demographic groups in their distributions, which we did not do in our analysis.
+2. We used a dataset designed for a particular task for another purpose. This potentially creates issues. Noteably, there is bias in who can and cannot recall certain news headlines. Though we tried to show that there was not a one-to-one correlation with recall and identification, there still is certainly a significant relationship.
+3. We used a frequentist model-based approach as this aligned with STATS701; however, a Bayesnian approach would have been much more appropriate for this problem. We could have tried to make statements such as, "*given the respondent recalled 4 headlines (2 real and 2 fake) and voted for Trump, the probability of correctly identify all 4 correctly was X*". We could have created priors from the data for the general population of people you recalled 4 headlines.
+
+
+
